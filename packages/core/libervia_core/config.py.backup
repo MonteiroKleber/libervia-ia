@@ -7,7 +7,7 @@ from __future__ import annotations
 
 import json
 import math
-from dataclasses import dataclass, field
+from dataclasses import dataclass, asdict, field
 from pathlib import Path
 from typing import Dict, Any, Optional, Union, Literal
 
@@ -72,21 +72,11 @@ class LiberviaConfig:
     tie_word_embeddings: bool = True
     scale_attn_weights: bool = True
     
-    # Atenção especializada (novo)
-    num_key_value_heads: Optional[int] = None  # Para Grouped Query Attention
-    attn_implementation: str = "auto"  # "auto", "manual", "flash_attention_2"
-    
     # Treinamento
     dropout: float = 0.0
     attention_dropout: float = 0.0
     residual_dropout: float = 0.0
     gradient_checkpointing: bool = False
-    
-    # Configurações de Output
-    output_attentions: bool = False
-    output_hidden_states: bool = False
-    use_cache: bool = True
-    use_return_dict: bool = True
     
     # Quantização
     quantization_config: Optional[Dict[str, Any]] = None
@@ -94,59 +84,37 @@ class LiberviaConfig:
     # Tipos de dados
     torch_dtype: str = "float16"  # "float32", "float16", "bfloat16"
     
-    # Metadados computados
+    # Metadados
     total_params: Optional[int] = field(default=None, init=False)
     memory_footprint_mb: Optional[float] = field(default=None, init=False)
     
     def __post_init__(self) -> None:
         """Validação e auto-preenchimento após inicialização."""
-        try:
-            # Auto-calcular head_dim se não fornecido
-            if self.head_dim is None:
-                if self.d_model % self.n_heads != 0:
-                    raise ValueError(
-                        f"d_model ({self.d_model}) deve ser divisível por n_heads ({self.n_heads})"
-                    )
-                self.head_dim = self.d_model // self.n_heads
-            
-            # Verificar consistência head_dim
-            expected_head_dim = self.d_model // self.n_heads
-            if self.head_dim != expected_head_dim:
+        # Auto-calcular head_dim se não fornecido
+        if self.head_dim is None:
+            if self.d_model % self.n_heads != 0:
                 raise ValueError(
-                    f"head_dim ({self.head_dim}) inconsistente com d_model/n_heads ({expected_head_dim})"
+                    f"d_model ({self.d_model}) deve ser divisível por n_heads ({self.n_heads})"
                 )
-            
-            # Auto-configurar num_key_value_heads para GQA
-            if self.num_key_value_heads is None:
-                self.num_key_value_heads = self.n_heads  # Multi-Head Attention padrão
-            
-            # Auto-configurar sliding_window
-            if self.sliding_window is None:
-                self.sliding_window = self.max_sequence_length
-            
-            # Calcular parâmetros totais de forma segura
-            try:
-                self.total_params = self.estimate_parameters()
-                self.memory_footprint_mb = self.estimate_memory_footprint()
-            except Exception as e:
-                print(f"Warning: Não foi possível calcular parâmetros: {e}")
-                self.total_params = 0
-                self.memory_footprint_mb = 0.0
-            
-            # Validações
-            self._validate_config()
-            
-        except Exception as e:
-            # Se falhar na inicialização, criar configuração mínima válida
-            print(f"Warning: Erro na inicialização de config, usando valores padrão: {e}")
-            if self.head_dim is None:
-                self.head_dim = self.d_model // self.n_heads
-            if self.num_key_value_heads is None:
-                self.num_key_value_heads = self.n_heads
-            if self.sliding_window is None:
-                self.sliding_window = self.max_sequence_length
-            self.total_params = 0
-            self.memory_footprint_mb = 0.0
+            self.head_dim = self.d_model // self.n_heads
+        
+        # Verificar consistência head_dim
+        expected_head_dim = self.d_model // self.n_heads
+        if self.head_dim != expected_head_dim:
+            raise ValueError(
+                f"head_dim ({self.head_dim}) inconsistente com d_model/n_heads ({expected_head_dim})"
+            )
+        
+        # Auto-configurar sliding_window
+        if self.sliding_window is None:
+            self.sliding_window = self.max_sequence_length
+        
+        # Calcular parâmetros totais
+        self.total_params = self.estimate_parameters()
+        self.memory_footprint_mb = self.estimate_memory_footprint()
+        
+        # Validações
+        self._validate_config()
     
     def _validate_config(self) -> None:
         """Validações de consistência da configuração."""
@@ -170,84 +138,63 @@ class LiberviaConfig:
         
         if self.torch_dtype not in ["float32", "float16", "bfloat16"]:
             raise ValueError("torch_dtype deve ser 'float32', 'float16' ou 'bfloat16'")
-        
-        if self.num_key_value_heads and self.n_heads % self.num_key_value_heads != 0:
-            raise ValueError("n_heads deve ser divisível por num_key_value_heads")
     
     def estimate_parameters(self) -> int:
         """Estima número total de parâmetros do modelo."""
-        try:
-            # Embedding de tokens
-            token_embed_params = self.vocab_size * self.d_model
-            
-            # Camadas transformer
-            # Cada camada tem: attn (4 projeções) + ffn (3 projeções) + 2 norms
-            hidden_dim = int(self.d_model * self.ffn_mult)
-            # Garantir múltiplo de 64 para otimização
-            hidden_dim = ((hidden_dim + 63) // 64) * 64
-            
-            # Atenção com suporte a GQA
-            q_params = self.d_model * self.n_heads * self.head_dim
-            kv_params = self.d_model * self.num_key_value_heads * self.head_dim * 2  # K e V
-            o_params = self.n_heads * self.head_dim * self.d_model
-            attn_params = q_params + kv_params + o_params
-            
+        # Embedding de tokens
+        token_embed_params = self.vocab_size * self.d_model
+        
+        # Camadas transformer
+        # Cada camada tem: attn (4 projeções) + ffn (3 projeções) + 2 norms
+        hidden_dim = int(self.d_model * self.ffn_mult)
+        # Garantir múltiplo de 64 para otimização
+        hidden_dim = ((hidden_dim + 63) // 64) * 64
+        
+        per_layer_params = (
+            # Attention: q, k, v, o projections
+            4 * (self.d_model * self.d_model) +
             # FFN: gate, up, down projections  
-            ffn_params = (
-                self.d_model * hidden_dim +  # gate_proj
-                self.d_model * hidden_dim +  # up_proj
-                hidden_dim * self.d_model    # down_proj
-            )
-            
+            3 * (self.d_model * hidden_dim) +
             # RMSNorm weights (2 per layer)
-            norm_params = 2 * self.d_model
-            
-            per_layer_params = attn_params + ffn_params + norm_params
-            transformer_params = self.n_layers * per_layer_params
-            
-            # Norma final
-            final_norm_params = self.d_model
-            
-            # Projeção de saída (compartilhada com embedding se tie_word_embeddings=True)
-            if self.tie_word_embeddings:
-                output_params = 0
-            else:
-                output_params = self.vocab_size * self.d_model
-            
-            total = token_embed_params + transformer_params + final_norm_params + output_params
-            return total
-            
-        except Exception as e:
-            print(f"Erro ao estimar parâmetros: {e}")
-            return 0
+            2 * self.d_model
+        )
+        
+        transformer_params = self.n_layers * per_layer_params
+        
+        # Norma final
+        final_norm_params = self.d_model
+        
+        # Projeção de saída (compartilhada com embedding se tie_word_embeddings=True)
+        if self.tie_word_embeddings:
+            output_params = 0
+        else:
+            output_params = self.vocab_size * self.d_model
+        
+        total = token_embed_params + transformer_params + final_norm_params + output_params
+        return total
     
     def estimate_memory_footprint(self) -> float:
         """Estima footprint de memória em MB para diferentes precisões."""
-        try:
-            if self.total_params is None or self.total_params == 0:
-                params = self.estimate_parameters()
-            else:
-                params = self.total_params
-            
-            # Bytes por parâmetro baseado no tipo
-            bytes_per_param = {
-                "float32": 4,
-                "float16": 2, 
-                "bfloat16": 2
-            }
-            
-            bytes_per_param_value = bytes_per_param.get(self.torch_dtype, 2)
-            total_bytes = params * bytes_per_param_value
-            
-            # Converter para MB
-            return total_bytes / (1024 * 1024)
-            
-        except Exception as e:
-            print(f"Erro ao estimar memória: {e}")
-            return 0.0
+        if self.total_params is None:
+            params = self.estimate_parameters()
+        else:
+            params = self.total_params
+        
+        # Bytes por parâmetro baseado no tipo
+        bytes_per_param = {
+            "float32": 4,
+            "float16": 2, 
+            "bfloat16": 2
+        }
+        
+        bytes_per_param_value = bytes_per_param[self.torch_dtype]
+        total_bytes = params * bytes_per_param_value
+        
+        # Converter para MB
+        return total_bytes / (1024 * 1024)
     
     @classmethod
-    def from_model_size(cls, size: str) -> "LiberviaConfig":
+    def from_model_size(cls, size: str) -> LiberviaConfig:
         """
         Factory method para criar configurações baseadas no tamanho do modelo.
         
@@ -265,7 +212,6 @@ class LiberviaConfig:
                 d_model=2048,
                 n_layers=22,
                 n_heads=16,
-                num_key_value_heads=16,  # Multi-Head Attention completa
                 ffn_mult=2.67,
                 vocab_size=32000,
                 max_sequence_length=4096,
@@ -278,7 +224,6 @@ class LiberviaConfig:
                 d_model=2560,
                 n_layers=32,
                 n_heads=20,
-                num_key_value_heads=20,  # Multi-Head Attention completa
                 ffn_mult=2.67,
                 vocab_size=32000,
                 max_sequence_length=8192,
@@ -291,7 +236,6 @@ class LiberviaConfig:
                 d_model=4096,
                 n_layers=32, 
                 n_heads=32,
-                num_key_value_heads=8,   # Grouped Query Attention para eficiência
                 ffn_mult=2.67,
                 vocab_size=32000,
                 max_sequence_length=8192,
@@ -302,7 +246,7 @@ class LiberviaConfig:
             raise ValueError(f"Tamanho de modelo não suportado: {size}. Use '2b', '4b' ou '7b'")
     
     @classmethod
-    def from_pretrained(cls, model_name_or_path: Union[str, Path]) -> "LiberviaConfig":
+    def from_pretrained(cls, model_name_or_path: Union[str, Path]) -> LiberviaConfig:
         """
         Carrega configuração de um modelo pré-treinado.
         
@@ -330,7 +274,7 @@ class LiberviaConfig:
         return cls.from_dict(config_dict)
     
     @classmethod
-    def from_dict(cls, config_dict: Dict[str, Any]) -> "LiberviaConfig":
+    def from_dict(cls, config_dict: Dict[str, Any]) -> LiberviaConfig:
         """
         Cria configuração a partir de dicionário.
         
@@ -340,12 +284,9 @@ class LiberviaConfig:
         Returns:
             Instância de configuração
         """
-        # Filtrar apenas campos válidos E que podem ser inicializados
-        valid_init_fields = {
-            field.name for field in cls.__dataclass_fields__.values() 
-            if field.init  # Apenas campos que podem ser passados no __init__
-        }
-        filtered_dict = {k: v for k, v in config_dict.items() if k in valid_init_fields}
+        # Filtrar apenas campos válidos
+        valid_fields = {field.name for field in cls.__dataclass_fields__.values()}
+        filtered_dict = {k: v for k, v in config_dict.items() if k in valid_fields}
         
         return cls(**filtered_dict)
     
@@ -356,23 +297,7 @@ class LiberviaConfig:
         Returns:
             Dicionário com todos os parâmetros
         """
-        # Usar approach manual para evitar recursão
-        result = {}
-        for field_name in self.__dataclass_fields__:
-            try:
-                value = getattr(self, field_name)
-                # Serializar apenas tipos básicos
-                if isinstance(value, (str, int, float, bool, type(None))):
-                    result[field_name] = value
-                elif isinstance(value, dict):
-                    result[field_name] = value
-                else:
-                    result[field_name] = str(value)
-            except Exception:
-                # Pular campos problemáticos
-                continue
-        
-        return result
+        return asdict(self)
     
     def save_pretrained(self, save_directory: Union[str, Path]) -> None:
         """
@@ -400,9 +325,9 @@ class LiberviaConfig:
             "float16": torch.float16,
             "bfloat16": torch.bfloat16
         }
-        return dtype_map.get(self.torch_dtype, torch.float16)
+        return dtype_map[self.torch_dtype]
     
-    def update(self, **kwargs) -> "LiberviaConfig":
+    def update(self, **kwargs) -> LiberviaConfig:
         """
         Cria nova configuração com parâmetros atualizados.
         
@@ -418,26 +343,19 @@ class LiberviaConfig:
     
     def __str__(self) -> str:
         """Representação string legível da configuração."""
-        try:
-            params_str = f"{self.total_params:,}" if self.total_params else "N/A"
-            params_b = f"({self.total_params/1e9:.1f}B)" if self.total_params and self.total_params > 0 else ""
-            memory_str = f"{self.memory_footprint_mb:.1f}MB" if self.memory_footprint_mb else "N/A"
-            
-            return (
-                f"LiberviaConfig(\n"
-                f"  model_name='{self.model_name}',\n"
-                f"  d_model={self.d_model},\n"
-                f"  n_layers={self.n_layers},\n"
-                f"  n_heads={self.n_heads},\n"
-                f"  vocab_size={self.vocab_size},\n"
-                f"  max_sequence_length={self.max_sequence_length},\n"
-                f"  total_params={params_str} {params_b},\n"
-                f"  memory_footprint={memory_str},\n"
-                f"  torch_dtype='{self.torch_dtype}'\n"
-                f")"
-            )
-        except Exception:
-            return f"LiberviaConfig(model_name='{getattr(self, 'model_name', 'unknown')}')"
+        return (
+            f"LiberviaConfig(\n"
+            f"  model_name='{self.model_name}',\n"
+            f"  d_model={self.d_model},\n"
+            f"  n_layers={self.n_layers},\n"
+            f"  n_heads={self.n_heads},\n"
+            f"  vocab_size={self.vocab_size},\n"
+            f"  max_sequence_length={self.max_sequence_length},\n"
+            f"  total_params={self.total_params:,} ({self.total_params/1e9:.1f}B),\n"
+            f"  memory_footprint={self.memory_footprint_mb:.1f}MB,\n"
+            f"  torch_dtype='{self.torch_dtype}'\n"
+            f")"
+        )
     
     def __repr__(self) -> str:
         """Representação técnica da configuração."""
@@ -445,23 +363,9 @@ class LiberviaConfig:
 
 
 # Configurações pré-definidas para acesso rápido
-def _create_default_configs():
-    """Cria configurações padrão de forma segura."""
-    try:
-        return {
-            "2b": LiberviaConfig.from_model_size("2b"),
-            "4b": LiberviaConfig.from_model_size("4b"),
-            "7b": LiberviaConfig.from_model_size("7b")
-        }
-    except Exception as e:
-        print(f"Warning: Erro ao criar configs padrão: {e}")
-        return {}
-
-_DEFAULT_CONFIGS = _create_default_configs()
-
-LIBERVIA_2B_CONFIG = _DEFAULT_CONFIGS.get("2b")
-LIBERVIA_4B_CONFIG = _DEFAULT_CONFIGS.get("4b") 
-LIBERVIA_7B_CONFIG = _DEFAULT_CONFIGS.get("7b")
+LIBERVIA_2B_CONFIG = LiberviaConfig.from_model_size("2b")
+LIBERVIA_4B_CONFIG = LiberviaConfig.from_model_size("4b") 
+LIBERVIA_7B_CONFIG = LiberviaConfig.from_model_size("7b")
 
 
 def get_config_for_size(size: str) -> LiberviaConfig:
@@ -479,17 +383,8 @@ def get_config_for_size(size: str) -> LiberviaConfig:
 
 if __name__ == "__main__":
     # Teste rápido das configurações
-    print("Testando configurações do libervia-ia-Core...")
-    
     for size in ["2b", "4b", "7b"]:
-        try:
-            config = LiberviaConfig.from_model_size(size)
-            print(f"\n✅ {size.upper()}:")
-            print(f"   Modelo: {config.model_name}")
-            print(f"   Parâmetros: {config.total_params:,}" if config.total_params else "   Parâmetros: N/A")
-            print(f"   Memória: {config.memory_footprint_mb:.1f} MB" if config.memory_footprint_mb else "   Memória: N/A")
-            print(f"   GQA: {config.n_heads}/{config.num_key_value_heads} heads")
-        except Exception as e:
-            print(f"❌ Erro no {size}: {e}")
-    
-    print("\n🎉 Teste de configuração concluído!")
+        config = LiberviaConfig.from_model_size(size)
+        print(f"\n{config}")
+        print(f"Parâmetros estimados: {config.total_params:,}")
+        print(f"Memória estimada: {config.memory_footprint_mb:.1f} MB")

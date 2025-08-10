@@ -1,6 +1,6 @@
 """
 libervia-ia-Core v1 - Main Model
-Implementação completa do modelo Transformer decoder-only compatível com HuggingFace
+Implementação completa do modelo Transformer decoder-only
 """
 
 from __future__ import annotations
@@ -12,14 +12,6 @@ import torch
 import torch.nn as nn
 from torch.nn import CrossEntropyLoss
 import torch.utils.checkpoint
-
-# Imports HuggingFace para compatibilidade
-try:
-    from transformers.modeling_outputs import CausalLMOutputWithPast, BaseModelOutputWithPast
-except ImportError:
-    # Fallback se transformers não disponível
-    CausalLMOutputWithPast = None
-    BaseModelOutputWithPast = None
 
 from .config import LiberviaConfig
 from .attention import create_attention_layer
@@ -180,7 +172,13 @@ class LiberviaModel(nn.Module):
     Modelo Transformer decoder-only principal.
     
     Este é o core do libervia-ia-Core, implementando um decoder Transformer
-    otimizado para geração de linguagem com características modernas.
+    otimizado para geração de linguagem com características modernas:
+    - RMSNorm ao invés de LayerNorm
+    - RoPE para codificação posicional
+    - SwiGLU FFN
+    - Flash Attention v2
+    - Sliding Window attention
+    - KV-Cache para inferência eficiente
     
     Args:
         config: Configuração do modelo
@@ -249,13 +247,13 @@ class LiberviaModel(nn.Module):
             cache_position: Posição atual no cache
             
         Returns:
-            BaseModelOutputWithPast ou tuple
+            ModelOutput com last_hidden_state, past_key_values, etc.
         """
-        # Configurações padrão usando config
-        output_attentions = output_attentions if output_attentions is not None else getattr(self.config, 'output_attentions', False)
-        output_hidden_states = output_hidden_states if output_hidden_states is not None else getattr(self.config, 'output_hidden_states', False)
-        use_cache = use_cache if use_cache is not None else getattr(self.config, 'use_cache', True)
-        return_dict = return_dict if return_dict is not None else getattr(self.config, 'use_return_dict', True)
+        # Configurações padrão
+        output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
+        output_hidden_states = output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
+        use_cache = use_cache if use_cache is not None else self.config.use_cache
+        return_dict = return_dict if return_dict is not None else self.config.use_return_dict
         
         # Obter embeddings
         if inputs_embeds is None:
@@ -343,46 +341,65 @@ class LiberviaModel(nn.Module):
                 outputs += (next_decoder_cache,)
             return outputs
         
-        # Retornar BaseModelOutputWithPast se disponível, senão dict
-        if BaseModelOutputWithPast is not None:
-            return BaseModelOutputWithPast(
-                last_hidden_state=hidden_states,
-                past_key_values=next_decoder_cache if use_cache else None,
-                hidden_states=all_hidden_states if output_hidden_states else None,
-                attentions=all_self_attns if output_attentions else None,
-            )
-        else:
-            return {
-                'last_hidden_state': hidden_states,
-                'past_key_values': next_decoder_cache if use_cache else None,
-                'hidden_states': all_hidden_states if output_hidden_states else None,
-                'attentions': all_self_attns if output_attentions else None,
-            }
+        return {
+            'last_hidden_state': hidden_states,
+            'past_key_values': next_decoder_cache if use_cache else None,
+            'hidden_states': all_hidden_states if output_hidden_states else None,
+            'attentions': all_self_attns if output_attentions else None,
+        }
     
     def post_init(self) -> None:
-        """Inicialização dos pesos após construção do modelo."""
+        """
+        Inicialização dos pesos após construção do modelo.
+        
+        Aplica inicialização seguindo melhores práticas:
+        - Xavier/Glorot para linear layers
+        - Normal para embeddings
+        - Zero para bias (quando presente)
+        """
         self.apply(self._init_weights)
     
     def _init_weights(self, module: nn.Module) -> None:
-        """Inicializa pesos de um módulo específico."""
+        """
+        Inicializa pesos de um módulo específico.
+        
+        Args:
+            module: Módulo para inicializar
+        """
         if isinstance(module, nn.Linear):
+            # Xavier initialization para linear layers
             torch.nn.init.xavier_uniform_(module.weight)
             if module.bias is not None:
                 torch.nn.init.zeros_(module.bias)
         elif isinstance(module, nn.Embedding):
+            # Normal initialization para embeddings
             torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
         elif isinstance(module, RMSNorm):
+            # Inicializar pesos da norma como 1
             torch.nn.init.ones_(module.weight)
     
     def num_parameters(self, only_trainable: bool = False) -> int:
-        """Conta número de parâmetros do modelo."""
+        """
+        Conta número de parâmetros do modelo.
+        
+        Args:
+            only_trainable: Se deve contar apenas parâmetros treináveis
+            
+        Returns:
+            Número total de parâmetros
+        """
         if only_trainable:
             return sum(p.numel() for p in self.parameters() if p.requires_grad)
         else:
             return sum(p.numel() for p in self.parameters())
     
     def get_memory_footprint(self) -> float:
-        """Calcula footprint de memória em MB."""
+        """
+        Calcula footprint de memória em MB.
+        
+        Returns:
+            Memória utilizada em MB
+        """
         mem_params = sum([param.nelement() * param.element_size() for param in self.parameters()])
         mem_buffers = sum([buf.nelement() * buf.element_size() for buf in self.buffers()])
         mem = mem_params + mem_buffers
@@ -463,9 +480,9 @@ class LiberviaForCausalLM(nn.Module):
             cache_position: Posição no cache
             
         Returns:
-            CausalLMOutputWithPast ou tuple
+            CausalLMOutput com loss, logits, etc.
         """
-        return_dict = return_dict if return_dict is not None else getattr(self.config, 'use_return_dict', True)
+        return_dict = return_dict if return_dict is not None else self.config.use_return_dict
         
         # Forward do modelo base
         outputs = self.model(
@@ -482,10 +499,7 @@ class LiberviaForCausalLM(nn.Module):
         )
         
         if return_dict:
-            if hasattr(outputs, 'last_hidden_state'):
-                hidden_states = outputs.last_hidden_state
-            else:
-                hidden_states = outputs['last_hidden_state']
+            hidden_states = outputs['last_hidden_state']
         else:
             hidden_states = outputs[0]
         
@@ -511,24 +525,15 @@ class LiberviaForCausalLM(nn.Module):
             output = (logits,) + outputs[1:]
             return (loss,) + output if loss is not None else output
         
-        # Retornar CausalLMOutputWithPast se disponível, senão dict
-        if CausalLMOutputWithPast is not None:
-            return CausalLMOutputWithPast(
-                loss=loss,
-                logits=logits,
-                past_key_values=getattr(outputs, 'past_key_values', None),
-                hidden_states=getattr(outputs, 'hidden_states', None),
-                attentions=getattr(outputs, 'attentions', None),
-            )
-        else:
-            result = {
-                'loss': loss,
-                'logits': logits,
-                'past_key_values': outputs.get('past_key_values') if hasattr(outputs, 'get') else getattr(outputs, 'past_key_values', None),
-                'hidden_states': outputs.get('hidden_states') if hasattr(outputs, 'get') else getattr(outputs, 'hidden_states', None),
-                'attentions': outputs.get('attentions') if hasattr(outputs, 'get') else getattr(outputs, 'attentions', None),
-            }
-            return result
+        result = {
+            'loss': loss,
+            'logits': logits,
+            'past_key_values': outputs.get('past_key_values'),
+            'hidden_states': outputs.get('hidden_states'),
+            'attentions': outputs.get('attentions'),
+        }
+        
+        return result
     
     def prepare_inputs_for_generation(
         self,
@@ -539,12 +544,25 @@ class LiberviaForCausalLM(nn.Module):
         cache_position: Optional[torch.Tensor] = None,
         **kwargs
     ) -> Dict[str, Any]:
-        """Prepara inputs para geração de texto."""
+        """
+        Prepara inputs para geração de texto.
+        
+        Args:
+            input_ids: IDs dos tokens
+            past_key_values: Cache KV
+            attention_mask: Máscara de atenção
+            inputs_embeds: Embeddings diretos
+            cache_position: Posição no cache
+            **kwargs: Argumentos adicionais
+            
+        Returns:
+            Dict com inputs preparados
+        """
         # Se usando cache, usar apenas último token
         if past_key_values is not None:
             if inputs_embeds is not None:  # Exception 1
                 input_ids = input_ids[:, -cache_position.shape[0] :]
-            elif input_ids.shape[1] != cache_position.shape[0]:  # Default case
+            elif input_ids.shape[1] != cache_position.shape[0]:  # Default case (the "else", a no op, is Exception 2)
                 input_ids = input_ids[:, cache_position]
         
         position_ids = None
@@ -591,3 +609,27 @@ class LiberviaForCausalLM(nn.Module):
 
 # Alias para compatibilidade
 LiberviaLMHeadModel = LiberviaForCausalLM
+
+
+if __name__ == "__main__":
+    # Teste básico do modelo
+    from .config import LiberviaConfig
+    
+    print("Testando libervia-ia-Core modelo...")
+    
+    config = LiberviaConfig.from_model_size("2b")
+    model = LiberviaForCausalLM(config)
+    
+    print(f"Modelo criado: {config.model_name}")
+    print(f"Parâmetros: {model.num_parameters():,}")
+    print(f"Memória: {model.get_memory_footprint():.1f} MB")
+    
+    # Teste forward
+    batch_size, seq_len = 2, 10
+    input_ids = torch.randint(0, config.vocab_size, (batch_size, seq_len))
+    
+    with torch.no_grad():
+        outputs = model(input_ids)
+        logits = outputs['logits'] if isinstance(outputs, dict) else outputs[0]
+        print(f"Output logits shape: {logits.shape}")
+        print("✅ Teste básico passou!")
