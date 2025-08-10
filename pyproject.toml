@@ -1,0 +1,90 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "libervia-ia"
+version = "1.0.0"
+description = "Modelo de linguagem otimizado para soberania digital e uso descentralizado"
+readme = "README.md"
+license = { file = "LICENSE" }
+requires-python = ">=3.9"
+authors = [
+    { name = "Libervia Team", email = "team@libervia.ai" },
+]
+
+dependencies = [
+    # Core ML
+    "torch>=2.1.0",
+    "transformers>=4.35.0",
+    "accelerate>=0.24.0",
+    "datasets>=2.14.0",
+    "tokenizers>=0.15.0",
+    "sentencepiece>=0.1.99",
+    
+    # Training & Optimization
+    "deepspeed>=0.12.0",
+    "peft>=0.6.0",
+    "bitsandbytes>=0.41.0",
+    
+    # Data Processing
+    "numpy>=1.24.0",
+    "pandas>=2.0.0",
+    "pyarrow>=13.0.0",
+    
+    # Configuration
+    "hydra-core>=1.3.0",
+    "omegaconf>=2.3.0",
+    "pydantic>=2.4.0",
+    "typer>=0.9.0",
+    
+    # API & Serving
+    "fastapi>=0.104.0",
+    "uvicorn[standard]>=0.24.0",
+    
+    # Utilities
+    "tqdm>=4.66.0",
+    "rich>=13.6.0",
+    "psutil>=5.9.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.4.0",
+    "pytest-cov>=4.1.0",
+    "pre-commit>=3.5.0",
+    "mypy>=1.6.0",
+    "ruff>=0.1.0",
+    "black>=23.9.0",
+    "isort>=5.12.0",
+]
+
+[project.scripts]
+libervia-train = "libervia_training.cli:main"
+libervia-infer = "libervia_inference.cli:main"
+
+# Tool configurations
+[tool.black]
+line-length = 88
+target-version = ["py39", "py310", "py311", "py312"]
+
+[tool.ruff]
+target-version = "py39"
+line-length = 88
+select = ["E", "W", "F", "I", "B", "C4", "UP"]
+ignore = ["E501"]
+
+[tool.mypy]
+python_version = "3.9"
+strict = true
+warn_return_any = true
+
+[tool.pytest.ini_options]
+minversion = "7.0"
+addopts = [
+    "-ra",
+    "--cov=packages",
+    "--cov-report=term-missing",
+    "--cov-fail-under=80",
+]
+testpaths = ["packages/*/tests", "tests"]
